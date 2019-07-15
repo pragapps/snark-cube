@@ -264,7 +264,7 @@ __global__ void mul_const_kernel(simple_t *problem_instances, uint32_t instance_
   cgbn_load(bn96bytes_env, m, &(problem_instances[my_instance]).m);
 
   cgbn_set(bn96bytes_env, tmp_r, a); 
-  for (int i = 0; i < 12; i ++) {
+  for (int i = 0; i < (constant - 1); i ++) {
     cgbn_add(bn96bytes_env, tmp_r1, tmp_r, a);
     if (cgbn_compare(bn96bytes_env, tmp_r1, m) >= 0) {
        cgbn_sub(bn96bytes_env, tmp_r2, tmp_r1, m);
@@ -331,7 +331,7 @@ void print_uint8_array(uint8_t* array, int size) {
     printf("\n");
 }
 
-std::vector<uint8_t*>* mycgbn_mul_by13(std::vector<uint8_t*> a, uint8_t* input_m_base, int num_bytes) {
+std::vector<uint8_t*>* mycgbn_mul_by11(std::vector<uint8_t*> a, uint8_t* input_m_base, int num_bytes) {
   int num_elements = a.size();
 
   simple_t *gpuInstances;
@@ -356,7 +356,7 @@ std::vector<uint8_t*>* mycgbn_mul_by13(std::vector<uint8_t*> a, uint8_t* input_m
 
   uint32_t num_blocks = (num_elements+IPB-1)/IPB;
 
-  mul_const_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements, 13);
+  mul_const_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements, 11);
   NEW_CUDA_CHECK(cudaDeviceSynchronize());
   CGBN_CHECK(report);
 
@@ -473,42 +473,6 @@ std::vector<uint8_t*>* mycgbn_montmul(std::vector<uint8_t*> a, std::vector<uint8
   return res_vector;
 }
 
-// Logic:  From the CODA webpage.
-//  var x0_y0 = fq_mul(x.a0, y.a0);
-//  var x1_y1 = fq_mul(x.a1, y.a1);
-//  var x1_y0 = fq_mul(x.a1, y.a0);
-//  var x0_y1 = fq_mul(x.a0, y.a1);
-//  return {
-//    a0: fq_add(a0_b0, fq_mul(a1_b1, alpha)),
-//    a1: fq_add(a1_b0, a0_b1)
-//  };
-//
-
-std::pair<std::vector<uint8_t*>, std::vector<uint8_t*> > 
-cgbn_quad_arith(std::vector<uint8_t*> x0_a0,
-                    std::vector<uint8_t*> x0_a1,
-                    std::vector<uint8_t*> y0_a0,
-                    std::vector<uint8_t*> y0_a1,
-                    uint8_t* mnt_modulus, int num_bytes, uint64_t inv) {
-  int num_elements = x0_a0.size();
-  std::vector<uint8_t*>* x0_y0;
-  std::vector<uint8_t*>* x0_y1;
-  std::vector<uint8_t*>* x1_y0;
-  std::vector<uint8_t*>* x1_y1;
-  std::vector<uint8_t*>* res_a0;
-  std::vector<uint8_t*>* res_a1;
-
-  x0_y0 = mycgbn_montmul(x0_a0, y0_a0, mnt_modulus, num_bytes, inv);
-  x0_y1 = mycgbn_montmul(x0_a0, y0_a1, mnt_modulus, num_bytes, inv);
-  x1_y0 = mycgbn_montmul(x0_a1, y0_a0, mnt_modulus, num_bytes, inv);
-  x1_y1 = mycgbn_montmul(x0_a1, y0_a1, mnt_modulus, num_bytes, inv);
-  res_a1 = mycgbn_add(*x1_y0, *x0_y1, mnt_modulus, num_bytes);
-  res_a0 = mycgbn_mul_by13(*x1_y1, mnt_modulus, num_bytes);
-  res_a0 = mycgbn_add(*x0_y0, *res_a0, mnt_modulus, num_bytes);
-  std::pair<std::vector<uint8_t*>, std::vector<uint8_t*> > res = std::make_pair(*res_a0, *res_a1);
-  return res;
-}
-
 // Logic: 
 // var alpha = fq(11);
 
@@ -551,36 +515,36 @@ compute_cubex_cuda(std::vector<uint8_t*> x0_a0,
   std::vector<uint8_t*>* x2_y1;
   std::vector<uint8_t*>* x2_y2;
 
-  x0_y0 = compute_newcuda(x0_a0, y0_a0, input_m_base, num_bytes, inv);
-  x0_y1 = compute_newcuda(x0_a0, y0_a1, input_m_base, num_bytes, inv);
-  x0_y2 = compute_newcuda(x0_a0, y0_a2, input_m_base, num_bytes, inv);
+  x0_y0 = mycgbn_montmul(x0_a0, y0_a0, input_m_base, num_bytes, inv);
+  x0_y1 = mycgbn_montmul(x0_a0, y0_a1, input_m_base, num_bytes, inv);
+  x0_y2 = mycgbn_montmul(x0_a0, y0_a2, input_m_base, num_bytes, inv);
 
-  x1_y0 = compute_newcuda(x0_a1, y0_a0, input_m_base, num_bytes, inv);
-  x1_y1 = compute_newcuda(x0_a1, y0_a1, input_m_base, num_bytes, inv);
-  x1_y2 = compute_newcuda(x0_a1, y0_a2, input_m_base, num_bytes, inv);
+  x1_y0 = mycgbn_montmul(x0_a1, y0_a0, input_m_base, num_bytes, inv);
+  x1_y1 = mycgbn_montmul(x0_a1, y0_a1, input_m_base, num_bytes, inv);
+  x1_y2 = mycgbn_montmul(x0_a1, y0_a2, input_m_base, num_bytes, inv);
 
-  x2_y0 = compute_newcuda(x0_a2, y0_a0, input_m_base, num_bytes, inv);
-  x2_y1 = compute_newcuda(x0_a2, y0_a1, input_m_base, num_bytes, inv);
-  x2_y2 = compute_newcuda(x0_a2, y0_a2, input_m_base, num_bytes, inv);
+  x2_y0 = mycgbn_montmul(x0_a2, y0_a0, input_m_base, num_bytes, inv);
+  x2_y1 = mycgbn_montmul(x0_a2, y0_a1, input_m_base, num_bytes, inv);
+  x2_y2 = mycgbn_montmul(x0_a2, y0_a2, input_m_base, num_bytes, inv);
 
   std::vector<uint8_t*>* res_a0_tmp1;
   std::vector<uint8_t*>* res_a0_tmp2;
 
   vec_ptr_t coeff0, coeff1, coeff2;
 
-  res_a0_tmp1 = compute_addcuda(*x1_y2, *x2_y1, input_m_base, num_bytes);
-  res_a0_tmp2 = compute_mul_by11_cuda(*res_a0_tmp1, input_m_base, num_bytes);
-  coeff0 = compute_addcuda(*x0_y0, *res_a0_tmp2, input_m_base, num_bytes);
+  res_a0_tmp1 = mycgbn_add(*x1_y2, *x2_y1, input_m_base, num_bytes);
+  res_a0_tmp2 = mycgbn_mul_by11(*res_a0_tmp1, input_m_base, num_bytes);
+  coeff0 = mycgbn_add(*x0_y0, *res_a0_tmp2, input_m_base, num_bytes);
 
   std::vector<uint8_t*>* res_a1_tmp1;
   std::vector<uint8_t*>* res_a1_tmp2;
-  res_a1_tmp1 = compute_mul_by11_cuda(*x2_y2, input_m_base, num_bytes);
-  res_a1_tmp2 = compute_addcuda(*x1_y0, *res_a1_tmp1, input_m_base, num_bytes);
-  coeff1 = compute_addcuda(*x0_y1, *res_a1_tmp2, input_m_base, num_bytes);
+  res_a1_tmp1 = mycgbn_mul_by11(*x2_y2, input_m_base, num_bytes);
+  res_a1_tmp2 = mycgbn_add(*x1_y0, *res_a1_tmp1, input_m_base, num_bytes);
+  coeff1 = mycgbn_add(*x0_y1, *res_a1_tmp2, input_m_base, num_bytes);
 
   std::vector<uint8_t*>* res_a2_tmp1;
-  res_a2_tmp1 = compute_addcuda(*x1_y1, *x2_y0, input_m_base, num_bytes);
-  coeff2 = compute_addcuda(*x0_y2, *res_a2_tmp1, input_m_base, num_bytes);
+  res_a2_tmp1 = mycgbn_add(*x1_y1, *x2_y0, input_m_base, num_bytes);
+  coeff2 = mycgbn_add(*x0_y2, *res_a2_tmp1, input_m_base, num_bytes);
 
   freeMem(x0_y0);
   free(x0_y0);
