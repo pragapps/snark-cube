@@ -5,23 +5,16 @@
 #include <gmp.h>
 #include <cassert>
 #include "cgbn/cgbn.h"
-#include "utility/support.h"
+#include "cgbn/utility/support.h"
 
 #define TPI 32
-#define BITS 768 
+#define BITS 1024 
 
 #define TPB 128 
 
-uint64_t INVERSE_64BIT_MNT4 = 0xf2044cfbe45e7fff;
-uint64_t INVERSE_64BIT_MNT6 = 0xc90776e23fffffff;
-
-typedef struct {
-  cgbn_mem_t<BITS> a;
-  cgbn_mem_t<BITS> b;
-  cgbn_mem_t<BITS> m;
-  cgbn_mem_t<BITS> r_lo;
-  cgbn_mem_t<BITS> r_hi;
-} mul_t;
+const uint64_t INVERSE_64BIT_MNT4 = 0xf2044cfbe45e7fff;
+const uint64_t INVERSE_64BIT_MNT6 = 0xc90776e23fffffff;
+const uint32_t MNT4_INV32 = 0xe45e7fff;
 
 typedef struct {
   cgbn_mem_t<BITS> a;
@@ -31,7 +24,207 @@ typedef struct {
 } simple_t;
 
 typedef cgbn_context_t<TPI>         context_t;
-typedef cgbn_env_t<context_t, 768> env96_t;
+typedef cgbn_env_t<context_t, 1024> env96_t;
+
+__device__ __forceinline__ uint32_t add_cc(uint32_t a, uint32_t b) {
+  uint32_t r;
+
+  asm volatile ("add.cc.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t addc_cc(uint32_t a, uint32_t b) {
+  uint32_t r;
+
+  asm volatile ("addc.cc.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t madhic(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t r;
+
+  asm volatile ("madc.hi.u32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t madlo_cc(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t r;
+
+  asm volatile ("mad.lo.cc.u32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t madloc_cc(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t r;
+
+  asm volatile ("madc.lo.cc.u32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+  return r;
+}
+
+__device__ __forceinline__ static int32_t fast_propagate_add(const uint32_t carry, uint32_t &x) {
+    uint32_t sync=0xFFFFFFFF, warp_thread=threadIdx.x & warpSize-1, lane=1<<warp_thread;
+    uint32_t g, p, c;
+    uint64_t sum;
+  
+    g=__ballot_sync(sync, carry==1);
+    p=__ballot_sync(sync, x==0xFFFFFFFF);
+ 
+    sum=(uint64_t)g+(uint64_t)g+(uint64_t)p;
+    c=lane&(p^sum);
+    
+    x=x+(c!=0);
+     
+    return sum>>32;   // -(p==0xFFFFFFFF);
+  }
+
+__device__ __forceinline__ uint32_t addc(uint32_t a, uint32_t b) {
+  uint32_t r;
+
+  asm volatile ("addc.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+
+  __device__ __forceinline__ static int32_t resolve_add(const int32_t carry, uint32_t &x) {
+    uint32_t sync=0xFFFFFFFF, warp_thread=threadIdx.x & warpSize-1, lane=1<<warp_thread;
+    uint32_t g, p, c;
+    uint64_t sum;
+  
+    c=__shfl_up_sync(sync, carry, 1);
+    c=(warp_thread==0) ? 0 : c;
+    x=add_cc(x, c);
+    c=addc(0, 0);
+
+    g=__ballot_sync(sync, c==1);
+    p=__ballot_sync(sync, x==0xFFFFFFFF);
+
+    sum=(uint64_t)g+(uint64_t)g+(uint64_t)p;
+    c=lane&(p^sum);
+    x=x+(c!=0);
+  
+    c=carry+(sum>>32);
+    return __shfl_sync(sync, c, 31);
+  }
+
+__device__
+uint32_t dev_mul_by_const(uint32_t& r, uint32_t a[], uint32_t f) {
+  uint32_t carry = 0;
+  uint32_t prd, lane = threadIdx.x % TPI;
+  prd = madlo_cc(a[lane], f, 0);
+  carry=madhic(a[lane], f, 0);
+  carry=resolve_add(carry, prd);
+  r = prd;
+  return carry;
+}
+
+// Result is stored in r = a + b. a is of size 2n, b is of size n.
+__device__
+uint32_t dev_add_ab(uint32_t r[], uint32_t a[], uint32_t b[]) {
+  uint32_t lane = threadIdx.x % TPI;
+  uint32_t sum, carry;
+  sum = add_cc(a[lane], b[lane]);
+  carry = addc_cc(0, 0);
+  carry = fast_propagate_add(carry, sum);
+
+  r[lane] = sum;
+  
+  // a[TPI] = a[TPI] + carry + b_msb_carry;
+  return carry;
+}
+
+__device__
+uint32_t dev_add_ab2(uint32_t& a, uint32_t b) {
+  uint32_t sum, carry;
+  sum = add_cc(a, b);
+  carry = addc_cc(0, 0);
+  carry = fast_propagate_add(carry, sum);
+
+  a = sum;
+  
+  // a[TPI] = a[TPI] + carry + b_msb_carry;
+  return carry;
+}
+
+__device__
+uint32_t add_extra_ui32(uint32_t& a, const uint32_t extra, const uint32_t extra_carry) {
+  uint32_t sum, carry, result;
+  uint32_t group_thread=threadIdx.x & TPI-1;
+  sum = add_cc(a, (group_thread==0) ? extra : 0);
+  carry = addc_cc(0, (group_thread==0) ? extra_carry : 0);
+
+  // Each time we call fast_propagate_add, we might have to "clear_carry()"
+  // to clear extra data when Padding threads are used.
+  result=fast_propagate_add(carry, sum);
+  a = sum;
+}
+
+__device__ __forceinline__ uint32_t sub_cc(uint32_t a, uint32_t b) {
+  uint32_t r;
+
+  asm volatile ("sub.cc.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t subc_cc(uint32_t a, uint32_t b) {
+  uint32_t r;
+
+  asm volatile ("subc.cc.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+
+ __device__ __forceinline__ static int32_t fast_propagate_sub(const uint32_t carry, uint32_t &x) {
+    uint32_t sync=0xFFFFFFFF, warp_thread=threadIdx.x & warpSize-1, lane=1<<warp_thread;
+    uint32_t g, p, c;
+    uint64_t sum;
+  
+    g=__ballot_sync(sync, carry==0xFFFFFFFF);
+    p=__ballot_sync(sync, x==0);
+
+    sum=(uint64_t)g+(uint64_t)g+(uint64_t)p;
+    c=lane&(p^sum);
+
+    x=x-(c!=0);
+    return (sum>>32);     // -(p==0xFFFFFFFF);
+  }
+
+__device__
+int dev_sub(uint32_t& a, uint32_t& b) {
+   uint32_t carry = sub_cc(a, b);
+   return -fast_propagate_sub(carry, a); 
+}
+
+__device__
+void mont_mul(uint32_t a[], uint32_t x[], uint32_t y[], uint32_t m[], uint32_t inv, int n) {
+  const uint32_t sync=0xFFFFFFFF;
+  uint32_t lane = threadIdx.x % TPI;
+  uint32_t ui, carry;
+  uint32_t temp = 0, temp2 = 0;
+  uint32_t temp_carry = 0, temp_carry2 = 0;
+  uint32_t my_lane_a;
+
+  //n = 24;
+  for (int i = 0; i < n; i ++) {
+     ui = madlo_cc(x[i], y[0], a[0]);
+     ui = madlo_cc(ui, inv, 0);
+     temp_carry = dev_mul_by_const(temp, y, x[i]);
+     temp_carry2 = dev_mul_by_const(temp2, m, ui);
+
+     temp_carry = temp_carry + dev_add_ab2(temp2, temp);
+     temp_carry = temp_carry + dev_add_ab2(a[lane], temp2);
+
+     // missing one BIG add.
+     add_extra_ui32(a[lane], temp_carry, temp_carry2);
+ 
+     // right shift one limb
+     my_lane_a = a[lane];
+     a[lane] =__shfl_down_sync(sync, my_lane_a, 1, TPI);
+     a[lane] = (lane == (TPI -1)) ? 0 : a[lane];
+  }
+
+  // compare and subtract.
+  uint32_t dummy_a = a[lane];
+  int which = dev_sub(dummy_a, m[lane]);
+  a[lane] = (which == -1) ? a[lane] : dummy_a; 
+}
 
 // See CGBN github for information on this code design.
 __global__ void mul_const_kernel(simple_t *problem_instances, uint32_t instance_count, uint32_t constant) {
@@ -48,7 +241,7 @@ __global__ void mul_const_kernel(simple_t *problem_instances, uint32_t instance_
   cgbn_load(bn96bytes_env, m, &(problem_instances[my_instance]).m);
 
   cgbn_set(bn96bytes_env, tmp_r, a); 
-  for (int i = 0; i < 12; i ++) {
+  for (int i = 0; i < constant; i ++) {
     cgbn_add(bn96bytes_env, tmp_r1, tmp_r, a);
     if (cgbn_compare(bn96bytes_env, tmp_r1, m) >= 0) {
        cgbn_sub(bn96bytes_env, tmp_r2, tmp_r1, m);
@@ -71,8 +264,8 @@ __global__ void add_kernel(simple_t *problem_instances, uint32_t instance_count)
   
   if(my_instance>=instance_count) return;
   
-  cgbn_load(bn96bytes_env, a, &(problem_instances[my_instance]).x);
-  cgbn_load(bn96bytes_env, b, &(problem_instances[my_instance]).y);
+  cgbn_load(bn96bytes_env, a, &(problem_instances[my_instance]).a);
+  cgbn_load(bn96bytes_env, b, &(problem_instances[my_instance]).b);
   cgbn_load(bn96bytes_env, m, &(problem_instances[my_instance]).m);
 
   cgbn_add(bn96bytes_env, res1, a, b);
@@ -82,29 +275,20 @@ __global__ void add_kernel(simple_t *problem_instances, uint32_t instance_count)
        cgbn_set(bn96bytes_env, res, res1); 
     }
 
-  cgbn_store(bn96bytes_env, &(problem_instances[my_instance].result), res);
+  cgbn_store(bn96bytes_env, &(problem_instances[my_instance].r), res);
 }
 
-__global__ void my_kernel(mul_t *problem_instances, uint32_t instance_count) {
-  context_t         bn_context;        
-  env96_t         bn96bytes_env(bn_context);  
-  env96_t::cgbn_t a, b, m;                   
-  env96_t::cgbn_wide_t mul_wide;
+__global__ 
+void my_mont_mul_kernel(simple_t *problem_instances, uint32_t instance_count) {
+  int32_t my_instance=(blockIdx.x*blockDim.x + threadIdx.x)/TPI;  // determine my instance number
   
-  int32_t my_instance=(blockIdx.x*blockDim.x + threadIdx.x)/TPI; 
-  
-  if(my_instance>=instance_count) return;
-  
-  cgbn_load(bn96bytes_env, a, &(problem_instances[my_instance]).x);
-  cgbn_load(bn96bytes_env, b, &(problem_instances[my_instance]).y);
-  cgbn_load(bn96bytes_env, m, &(problem_instances[my_instance]).m);
-
-  cgbn_mul_wide(bn96bytes_env, mul_wide, a, b);
-
-  cgbn_store(bn96bytes_env, &(problem_instances[my_instance].mul_lo), mul_wide._low);
-  cgbn_store(bn96bytes_env, &(problem_instances[my_instance].mul_hi), mul_wide._high);
+  if(my_instance>=instance_count) return;                         // return if my_instance is not valid
+  cgbn_mem_t<BITS>& a = problem_instances[my_instance].a;
+  cgbn_mem_t<BITS>& b = problem_instances[my_instance].b;
+  cgbn_mem_t<BITS>& m = problem_instances[my_instance].m;
+  cgbn_mem_t<BITS>& r = problem_instances[my_instance].r;
+  mont_mul(r._limbs, a._limbs, b._limbs, m._limbs, MNT4_INV32, 32);
 }
-
 
 void print_uint8_array(uint8_t* array, int size) {
     for (int i = 0; i < size; i ++) {
@@ -123,7 +307,7 @@ std::vector<uint8_t*>* mycgbn_mul_by13(std::vector<uint8_t*> a, uint8_t* input_m
   // create a cgbn_error_report for CGBN to report back errors
   NEW_CUDA_CHECK(cgbn_error_report_alloc(&report));
   for (int i = 0; i < num_elements; i ++) {
-    std::memcpy((void*)instance_array[i].x._limbs, (const void*) a[i], num_bytes);
+    std::memcpy((void*)instance_array[i].a._limbs, (const void*) a[i], num_bytes);
     std::memcpy((void*)instance_array[i].m._limbs, (const void*) input_m_base, num_bytes);
   }
 
@@ -142,7 +326,7 @@ std::vector<uint8_t*>* mycgbn_mul_by13(std::vector<uint8_t*> a, uint8_t* input_m
   uint32_t num_blocks = (num_elements+IPB-1)/IPB;
   // printf("\n Number of blocks = %d", num_blocks);
 
-  mul_by13_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements);
+  mul_const_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements, 13);
   NEW_CUDA_CHECK(cudaDeviceSynchronize());
   CGBN_CHECK(report);
 
@@ -153,7 +337,7 @@ std::vector<uint8_t*>* mycgbn_mul_by13(std::vector<uint8_t*> a, uint8_t* input_m
   std::vector<uint8_t*>* res_vector = new std::vector<uint8_t*>();
   for (int i = 0; i < num_elements; i ++) {
      uint8_t* result = (uint8_t*) malloc(num_bytes * sizeof(uint8_t));
-     std::memcpy((void*)result, (const void*)instance_array[i].result._limbs, num_bytes);
+     std::memcpy((void*)result, (const void*)instance_array[i].r._limbs, num_bytes);
      res_vector->emplace_back(result);
   }
 
@@ -172,8 +356,8 @@ std::vector<uint8_t*>* mycgbn_add(std::vector<uint8_t*> a, std::vector<uint8_t*>
   // create a cgbn_error_report for CGBN to report back errors
   NEW_CUDA_CHECK(cgbn_error_report_alloc(&report));
   for (int i = 0; i < num_elements; i ++) {
-    std::memcpy((void*)instance_array[i].x._limbs, (const void*) a[i], num_bytes);
-    std::memcpy((void*)instance_array[i].y._limbs, (const void*) b[i], num_bytes);
+    std::memcpy((void*)instance_array[i].a._limbs, (const void*) a[i], num_bytes);
+    std::memcpy((void*)instance_array[i].b._limbs, (const void*) b[i], num_bytes);
     std::memcpy((void*)instance_array[i].m._limbs, (const void*) input_m_base, num_bytes);
   }
 
@@ -197,7 +381,7 @@ std::vector<uint8_t*>* mycgbn_add(std::vector<uint8_t*> a, std::vector<uint8_t*>
   std::vector<uint8_t*>* res_vector = new std::vector<uint8_t*>();
   for (int i = 0; i < num_elements; i ++) {
      uint8_t* result = (uint8_t*) malloc(num_bytes * sizeof(uint8_t));
-     std::memcpy((void*)result, (const void*)instance_array[i].result._limbs, num_bytes);
+     std::memcpy((void*)result, (const void*)instance_array[i].r._limbs, num_bytes);
      res_vector->emplace_back(result);
   }
 
@@ -209,63 +393,41 @@ std::vector<uint8_t*>* mycgbn_add(std::vector<uint8_t*> a, std::vector<uint8_t*>
 std::vector<uint8_t*>* mycgbn_montmul(std::vector<uint8_t*> a, std::vector<uint8_t*> b, uint8_t* input_m_base, int num_bytes, uint64_t inv) {
   int num_elements = a.size();
 
-  mul_t *gpuInstances;
-  mul_t* instance_array = (mul_t*) malloc(sizeof(mul_t) * num_elements);
+  simple_t *gpuInstances;
+  simple_t* instance_array = (simple_t*) malloc(sizeof(simple_t) * num_elements);
   cgbn_error_report_t *report;
 
   // create a cgbn_error_report for CGBN to report back errors
   NEW_CUDA_CHECK(cgbn_error_report_alloc(&report));
   for (int i = 0; i < num_elements; i ++) {
-    std::memcpy((void*)instance_array[i].x._limbs, (const void*) a[i], num_bytes);
-    std::memcpy((void*)instance_array[i].y._limbs, (const void*) b[i], num_bytes);
+    std::memcpy((void*)instance_array[i].a._limbs, (const void*) a[i], num_bytes);
+    std::memcpy((void*)instance_array[i].b._limbs, (const void*) b[i], num_bytes);
     std::memcpy((void*)instance_array[i].m._limbs, (const void*) input_m_base, num_bytes);
   }
 
-  printf("Copying instances to the GPU ...\n");
   NEW_CUDA_CHECK(cudaSetDevice(0));
-  NEW_CUDA_CHECK(cudaMalloc((void **)&gpuInstances, sizeof(mul_t)*num_elements));
-  NEW_CUDA_CHECK(cudaMemcpy(gpuInstances, instance_array, sizeof(mul_t)*num_elements, cudaMemcpyHostToDevice));
+  NEW_CUDA_CHECK(cudaMalloc((void **)&gpuInstances, sizeof(simple_t)*num_elements));
+  NEW_CUDA_CHECK(cudaMemcpy(gpuInstances, instance_array, sizeof(simple_t)*num_elements, cudaMemcpyHostToDevice));
   
   int tpb = TPB;
-  printf("\n Threads per block =%d", tpb);
   int IPB = TPB/TPI;
   int tpi = TPI;
-  printf("\n Threads per instance = %d", tpi);
-  printf("\n Instances per block = %d", IPB);
 
   uint32_t num_blocks = (num_elements+IPB-1)/IPB;
-  printf("\n Number of blocks = %d", num_blocks);
 
-  my_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements);
+  my_mont_mul_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements);
   NEW_CUDA_CHECK(cudaDeviceSynchronize());
   CGBN_CHECK(report);
 
-  NEW_CUDA_CHECK(cudaMemcpy(instance_array, gpuInstances, sizeof(mul_t)*num_elements, cudaMemcpyDeviceToHost));
-
-
-  int num_limbs = num_bytes / 8;
-  printf("\n Setting num 64 limbs = %d", num_limbs);
-  mp_limb_t* num = (mp_limb_t*)malloc(sizeof(mp_limb_t) * num_limbs * 2);
-  mp_limb_t* modulus = (mp_limb_t*)malloc(sizeof(mp_limb_t) * num_limbs);
-  std::memcpy((void*) modulus, (const void*) instance_array->m._limbs, num_bytes);
+  NEW_CUDA_CHECK(cudaMemcpy(instance_array, gpuInstances, sizeof(simple_t)*num_elements, cudaMemcpyDeviceToHost));
 
   std::vector<uint8_t*>* res_vector = new std::vector<uint8_t*>();
   for (int i = 0; i < num_elements; i ++) {
-    // Reduce
-    std::memcpy((void*)num, (const void*)instance_array[i].mul_lo._limbs, num_bytes);
-    std::memcpy((void*) (num + num_limbs), (const void*)instance_array[i].mul_hi._limbs, num_bytes);
-    mp_limb_t* fresult = (mp_limb_t*)malloc(sizeof(mp_limb_t) * num_limbs);
- 
-    // printf("\n Dumping 64 byte limb wide num [%d]:", i);
-    // gmp_printf("%Nx\n", num, num_limbs * 2); 
-
-    reduce_wide(fresult, num, modulus, inv, num_limbs);
-
-    // store the result.
-    res_vector->emplace_back((uint8_t*)fresult);
+     uint8_t* result = (uint8_t*) malloc(num_bytes * sizeof(uint8_t));
+     std::memcpy((void*)result, (const void*)instance_array[i].r._limbs, num_bytes);
+     res_vector->emplace_back(result);
   }
-  free(num);
-  free(modulus);
+
   free(instance_array);
   cudaFree(gpuInstances);
   return res_vector;
@@ -283,7 +445,7 @@ std::vector<uint8_t*>* mycgbn_montmul(std::vector<uint8_t*> a, std::vector<uint8
 //
 
 std::pair<std::vector<uint8_t*>, std::vector<uint8_t*> > 
-compute_quadex_cuda(std::vector<uint8_t*> x0_a0,
+cgbn_quad_arith(std::vector<uint8_t*> x0_a0,
                     std::vector<uint8_t*> x0_a1,
                     std::vector<uint8_t*> y0_a0,
                     std::vector<uint8_t*> y0_a1,
@@ -306,4 +468,3 @@ compute_quadex_cuda(std::vector<uint8_t*> x0_a0,
   std::pair<std::vector<uint8_t*>, std::vector<uint8_t*> > res = std::make_pair(*res_a0, *res_a1);
   return res;
 }
-
