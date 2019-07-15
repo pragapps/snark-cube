@@ -16,6 +16,8 @@ const uint64_t INVERSE_64BIT_MNT4 = 0xf2044cfbe45e7fff;
 const uint64_t INVERSE_64BIT_MNT6 = 0xc90776e23fffffff;
 const uint32_t MNT4_INV32 = 0xe45e7fff;
 
+typedef std::vector<uint8_t*>* vec_ptr_t;
+
 typedef struct {
   cgbn_mem_t<BITS> a;
   cgbn_mem_t<BITS> b;
@@ -505,4 +507,114 @@ cgbn_quad_arith(std::vector<uint8_t*> x0_a0,
   res_a0 = mycgbn_add(*x0_y0, *res_a0, mnt_modulus, num_bytes);
   std::pair<std::vector<uint8_t*>, std::vector<uint8_t*> > res = std::make_pair(*res_a0, *res_a1);
   return res;
+}
+
+// Logic: 
+// var alpha = fq(11);
+
+// var fq3_mul = (x, y) => {
+//   var x0_y0 = fq_mul(x.a0, y.a0);
+//   var x0_y1 = fq_mul(x.a0, y.a1);
+//   var x0_y2 = fq_mul(x.a0, y.a2);
+// 
+//   var x1_y0 = fq_mul(x.a1, y.a0);
+//   var x1_y1 = fq_mul(x.a1, y.a1);
+//   var x1_y2 = fq_mul(x.a1, y.a2);
+// 
+//   var x2_y0 = fq_mul(x.a2, y.a0);
+//   var x2_y1 = fq_mul(x.a2, y.a1);
+//   var x2_y2 = fq_mul(x.a2, y.a2);
+// 
+//   return {
+//     a0: fq_add(x0_y0, fq_mul(alpha, fq_add(x1_y2, x2_y1))),
+//     a1: fq_add(x0_y1, fq_add(x1_y0, fq_mul(alpha, x2_y2))),
+//     a2: fq_add(x0_y2, fq_add(x1_y1, x2_y0))
+//   };
+// };
+
+std::tuple<vec_ptr_t, vec_ptr_t, vec_ptr_t> 
+compute_cubex_cuda(std::vector<uint8_t*> x0_a0,
+                    std::vector<uint8_t*> x0_a1,
+                    std::vector<uint8_t*> x0_a2,
+                    std::vector<uint8_t*> y0_a0,
+                    std::vector<uint8_t*> y0_a1,
+                    std::vector<uint8_t*> y0_a2,
+                    uint8_t* input_m_base, int num_bytes, uint64_t inv) {
+  int num_elements = x0_a0.size();
+  std::vector<uint8_t*>* x0_y0;
+  std::vector<uint8_t*>* x0_y1;
+  std::vector<uint8_t*>* x0_y2;
+  std::vector<uint8_t*>* x1_y0;
+  std::vector<uint8_t*>* x1_y1;
+  std::vector<uint8_t*>* x1_y2;
+  std::vector<uint8_t*>* x2_y0;
+  std::vector<uint8_t*>* x2_y1;
+  std::vector<uint8_t*>* x2_y2;
+
+  x0_y0 = compute_newcuda(x0_a0, y0_a0, input_m_base, num_bytes, inv);
+  x0_y1 = compute_newcuda(x0_a0, y0_a1, input_m_base, num_bytes, inv);
+  x0_y2 = compute_newcuda(x0_a0, y0_a2, input_m_base, num_bytes, inv);
+
+  x1_y0 = compute_newcuda(x0_a1, y0_a0, input_m_base, num_bytes, inv);
+  x1_y1 = compute_newcuda(x0_a1, y0_a1, input_m_base, num_bytes, inv);
+  x1_y2 = compute_newcuda(x0_a1, y0_a2, input_m_base, num_bytes, inv);
+
+  x2_y0 = compute_newcuda(x0_a2, y0_a0, input_m_base, num_bytes, inv);
+  x2_y1 = compute_newcuda(x0_a2, y0_a1, input_m_base, num_bytes, inv);
+  x2_y2 = compute_newcuda(x0_a2, y0_a2, input_m_base, num_bytes, inv);
+
+  std::vector<uint8_t*>* res_a0_tmp1;
+  std::vector<uint8_t*>* res_a0_tmp2;
+
+  vec_ptr_t coeff0, coeff1, coeff2;
+
+  res_a0_tmp1 = compute_addcuda(*x1_y2, *x2_y1, input_m_base, num_bytes);
+  res_a0_tmp2 = compute_mul_by11_cuda(*res_a0_tmp1, input_m_base, num_bytes);
+  coeff0 = compute_addcuda(*x0_y0, *res_a0_tmp2, input_m_base, num_bytes);
+
+  std::vector<uint8_t*>* res_a1_tmp1;
+  std::vector<uint8_t*>* res_a1_tmp2;
+  res_a1_tmp1 = compute_mul_by11_cuda(*x2_y2, input_m_base, num_bytes);
+  res_a1_tmp2 = compute_addcuda(*x1_y0, *res_a1_tmp1, input_m_base, num_bytes);
+  coeff1 = compute_addcuda(*x0_y1, *res_a1_tmp2, input_m_base, num_bytes);
+
+  std::vector<uint8_t*>* res_a2_tmp1;
+  res_a2_tmp1 = compute_addcuda(*x1_y1, *x2_y0, input_m_base, num_bytes);
+  coeff2 = compute_addcuda(*x0_y2, *res_a2_tmp1, input_m_base, num_bytes);
+
+  freeMem(x0_y0);
+  free(x0_y0);
+  freeMem(x0_y1);
+  free(x0_y1);
+  freeMem(x0_y2);
+  free(x0_y2);
+
+  freeMem(x1_y0);
+  free(x1_y0);
+  freeMem(x1_y1);
+  free(x1_y1);
+  freeMem(x1_y2);
+  free(x1_y2);
+
+  freeMem(x2_y0);
+  free(x2_y0);
+  freeMem(x2_y1);
+  free(x2_y1);
+  freeMem(x2_y2);
+  free(x2_y2);
+
+  freeMem(res_a0_tmp1);
+  free(res_a0_tmp1);
+  freeMem(res_a0_tmp2);
+  free(res_a0_tmp2);
+
+  freeMem(res_a1_tmp1);
+  free(res_a1_tmp1);
+  freeMem(res_a1_tmp2);
+  free(res_a1_tmp2);
+
+  freeMem(res_a2_tmp1);
+  free(res_a2_tmp1);
+
+  return std::make_tuple(coeff0, coeff1, coeff2);
 }

@@ -1,6 +1,6 @@
-# Quadratic extension arithmetic
+# Cubic extension arithmetic
 
-This is a submission for the Quadratic Arithmetic tutorial part of the snark challenge.
+This is a submission for the Cubic extension arithmentic tutorial part of the snark challenge.
 
 To build and run:
 
@@ -8,5 +8,4 @@ To build and run:
 1. `./build.sh`
 2. `./main compute inputs outputs`
 
-Optional: Set GENCODES in Makefile
 
