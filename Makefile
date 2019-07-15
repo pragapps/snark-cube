@@ -1,5 +1,4 @@
 CXX ?= g++
-GENCODES ?= 60
 GENCODES = 75 
 
 ifdef GMP_HOME
