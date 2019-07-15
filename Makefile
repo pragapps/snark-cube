@@ -1,6 +1,6 @@
 CXX ?= g++
 GENCODES ?= 60
-GENCODES = 61
+GENCODES = 75 
 
 ifdef GMP_HOME
   GMP_INC := -I$(GMP_HOME)/include
