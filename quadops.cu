@@ -8,7 +8,7 @@
 #include "cgbn/utility/support.h"
 
 #define TPI 32
-#define BITS 1024 
+#define BITS 768 
 
 #define TPB 128 
 
@@ -21,10 +21,32 @@ typedef struct {
   cgbn_mem_t<BITS> b;
   cgbn_mem_t<BITS> m;
   cgbn_mem_t<BITS> r;
+  cgbn_mem_t<BITS> r_lo;
+  cgbn_mem_t<BITS> r_hi;
 } simple_t;
 
 typedef cgbn_context_t<TPI>         context_t;
-typedef cgbn_env_t<context_t, 1024> env96_t;
+typedef cgbn_env_t<context_t, 768> env96_t;
+
+void reduce_wide(mp_limb_t* result, mp_limb_t* num, mp_limb_t* modulus, uint64_t inv, int n) {
+        mp_limb_t *res = num;
+        for (size_t i = 0; i < n; ++i)
+        {
+            mp_limb_t k = inv * res[i];
+            /* calculate res = res + k * mod * b^i */
+            mp_limb_t carryout = mpn_addmul_1(res+i, modulus, n, k);
+            carryout = mpn_add_1(res+n+i, res+n+i, n-i, carryout);
+            assert(carryout == 0);
+        }
+
+        if (mpn_cmp(res+n, modulus, n) >= 0)
+        {
+            const mp_limb_t borrow = mpn_sub(res+n, res+n, n, modulus, n);
+            assert(borrow == 0);
+        }
+
+        mpn_copyi(result, res+n, n);
+}
 
 __device__ __forceinline__ uint32_t add_cc(uint32_t a, uint32_t b) {
   uint32_t r;
@@ -201,7 +223,6 @@ void mont_mul(uint32_t a[], uint32_t x[], uint32_t y[], uint32_t m[], uint32_t i
   uint32_t temp_carry = 0, temp_carry2 = 0;
   uint32_t my_lane_a;
 
-  //n = 24;
   for (int i = 0; i < n; i ++) {
      ui = madlo_cc(x[i], y[0], a[0]);
      ui = madlo_cc(ui, inv, 0);
@@ -241,7 +262,7 @@ __global__ void mul_const_kernel(simple_t *problem_instances, uint32_t instance_
   cgbn_load(bn96bytes_env, m, &(problem_instances[my_instance]).m);
 
   cgbn_set(bn96bytes_env, tmp_r, a); 
-  for (int i = 0; i < constant; i ++) {
+  for (int i = 0; i < 12; i ++) {
     cgbn_add(bn96bytes_env, tmp_r1, tmp_r, a);
     if (cgbn_compare(bn96bytes_env, tmp_r1, m) >= 0) {
        cgbn_sub(bn96bytes_env, tmp_r2, tmp_r1, m);
@@ -278,16 +299,27 @@ __global__ void add_kernel(simple_t *problem_instances, uint32_t instance_count)
   cgbn_store(bn96bytes_env, &(problem_instances[my_instance].r), res);
 }
 
-__global__ 
-void my_mont_mul_kernel(simple_t *problem_instances, uint32_t instance_count) {
+__global__
+ void mul_wide_kernel(simple_t *problem_instances, uint32_t instance_count) {
+  context_t         bn_context;                                 // create a CGBN context
+  env96_t         bn96bytes_env(bn_context);                     // construct a bn environment for 1024 bit math
+  env96_t::cgbn_t a, b, m;                      // three 1024-bit values (spread across a warp)
+  env96_t::cgbn_wide_t mul_wide;
+  // uint32_t np0;
+  
   int32_t my_instance=(blockIdx.x*blockDim.x + threadIdx.x)/TPI;  // determine my instance number
   
   if(my_instance>=instance_count) return;                         // return if my_instance is not valid
-  cgbn_mem_t<BITS>& a = problem_instances[my_instance].a;
-  cgbn_mem_t<BITS>& b = problem_instances[my_instance].b;
-  cgbn_mem_t<BITS>& m = problem_instances[my_instance].m;
-  cgbn_mem_t<BITS>& r = problem_instances[my_instance].r;
-  mont_mul(r._limbs, a._limbs, b._limbs, m._limbs, MNT4_INV32, 32);
+  
+  cgbn_load(bn96bytes_env, a, &(problem_instances[my_instance]).a);
+  cgbn_load(bn96bytes_env, b, &(problem_instances[my_instance]).b);
+  cgbn_load(bn96bytes_env, m, &(problem_instances[my_instance]).m);
+
+
+  cgbn_mul_wide(bn96bytes_env, mul_wide, a, b);
+
+  cgbn_store(bn96bytes_env, &(problem_instances[my_instance].r_lo), mul_wide._low);
+  cgbn_store(bn96bytes_env, &(problem_instances[my_instance].r_hi), mul_wide._high);
 }
 
 void print_uint8_array(uint8_t* array, int size) {
@@ -317,21 +349,15 @@ std::vector<uint8_t*>* mycgbn_mul_by13(std::vector<uint8_t*> a, uint8_t* input_m
   NEW_CUDA_CHECK(cudaMemcpy(gpuInstances, instance_array, sizeof(simple_t)*num_elements, cudaMemcpyHostToDevice));
   
   int tpb = TPB;
-  // printf("\n Threads per block =%d", tpb);
   int IPB = TPB/TPI;
   int tpi = TPI;
-  // printf("\n Threads per instance = %d", tpi);
-  // printf("\n Instances per block = %d", IPB);
 
   uint32_t num_blocks = (num_elements+IPB-1)/IPB;
-  // printf("\n Number of blocks = %d", num_blocks);
 
   mul_const_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements, 13);
   NEW_CUDA_CHECK(cudaDeviceSynchronize());
   CGBN_CHECK(report);
 
-  // copy the instances back from gpuMemory
-  // printf("Copying results back to CPU ...\n");
   NEW_CUDA_CHECK(cudaMemcpy(instance_array, gpuInstances, sizeof(simple_t)*num_elements, cudaMemcpyDeviceToHost));
 
   std::vector<uint8_t*>* res_vector = new std::vector<uint8_t*>();
@@ -415,19 +441,31 @@ std::vector<uint8_t*>* mycgbn_montmul(std::vector<uint8_t*> a, std::vector<uint8
 
   uint32_t num_blocks = (num_elements+IPB-1)/IPB;
 
-  my_mont_mul_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements);
+  mul_wide_kernel<<<num_blocks, TPB>>>(gpuInstances, num_elements);
   NEW_CUDA_CHECK(cudaDeviceSynchronize());
   CGBN_CHECK(report);
 
   NEW_CUDA_CHECK(cudaMemcpy(instance_array, gpuInstances, sizeof(simple_t)*num_elements, cudaMemcpyDeviceToHost));
 
+  int num_limbs = num_bytes / 8;
+  mp_limb_t* num = (mp_limb_t*)malloc(sizeof(mp_limb_t) * num_limbs * 2);
+  mp_limb_t* modulus = (mp_limb_t*)malloc(sizeof(mp_limb_t) * num_limbs);
+  std::memcpy((void*) modulus, (const void*) instance_array->m._limbs, num_bytes);
+
   std::vector<uint8_t*>* res_vector = new std::vector<uint8_t*>();
   for (int i = 0; i < num_elements; i ++) {
-     uint8_t* result = (uint8_t*) malloc(num_bytes * sizeof(uint8_t));
-     std::memcpy((void*)result, (const void*)instance_array[i].r._limbs, num_bytes);
-     res_vector->emplace_back(result);
-  }
+    // Reduce
+    std::memcpy((void*)num, (const void*)instance_array[i].r_lo._limbs, num_bytes);
+    std::memcpy((void*) (num + num_limbs), (const void*)instance_array[i].r_hi._limbs, num_bytes);
+    mp_limb_t* fresult = (mp_limb_t*)malloc(sizeof(mp_limb_t) * num_limbs);
 
+    reduce_wide(fresult, num, modulus, inv, num_limbs);
+
+    // store the result.
+    res_vector->emplace_back((uint8_t*)fresult);
+  }
+  free(num);
+  free(modulus);
   free(instance_array);
   cudaFree(gpuInstances);
   return res_vector;
