@@ -1,5 +1,5 @@
 CXX ?= g++
-GENCODES = 61 
+GENCODES = 75 
 
 ifdef GMP_HOME
   GMP_INC := -I$(GMP_HOME)/include
@@ -32,7 +32,7 @@ bench/bench: bench/bench.cu
 
 bench: bench/bench
 
-main: main.cu quadops.cu
+main: main.cu cubeops.cu
 	nvcc $(NVCC_OPT_FLAGS) $(NVCC_FLAGS) $(GENCODES:%=--gpu-architecture=compute_%) $(GENCODES:%=--gpu-code=sm_%) $(INCLUDE_DIRS) $(NVCC_LIBS) -o $@ $<
 
 .PHONY: clean

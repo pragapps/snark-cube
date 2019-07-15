@@ -4,7 +4,7 @@
 #include <vector>
 
 // Our main implementation that uses CGBN exclusively is in quadops.cu file.
-#include "quadops.cu"
+#include "cubeops.cu"
 
 // Names inherited from cuda-fixnum.
 const unsigned int bytes_per_elem = 128;
@@ -96,34 +96,42 @@ int main(int argc, char* argv[]) {
     printf("\n\n Fresh set N = %d\n", n);
     std::vector<uint8_t*> x0_a0;
     std::vector<uint8_t*> x0_a1;
+    std::vector<uint8_t*> x0_a2;
     for (size_t i = 0; i < n; ++i) {
       x0_a0.emplace_back(read_mnt_fq_2(inputs));
       x0_a1.emplace_back(read_mnt_fq_2(inputs));
+      x0_a2.emplace_back(read_mnt_fq_2(inputs));
     }
 
     std::vector<uint8_t*> y0_a0;
     std::vector<uint8_t*> y0_a1;
+    std::vector<uint8_t*> y0_a2;
     for (size_t i = 0; i < n; ++i) {
       y0_a0.emplace_back(read_mnt_fq_2(inputs));
       y0_a1.emplace_back(read_mnt_fq_2(inputs));
+      y0_a2.emplace_back(read_mnt_fq_2(inputs));
     }
    
-    std::pair<std::vector<uint8_t*>, std::vector<uint8_t*> > res
-              = cgbn_quad_arith(x0_a0, x0_a1, y0_a0, y0_a1, mnt4_modulus, io_bytes_per_elem, INVERSE_64BIT_MNT4);
+    std::tuple<vec_ptr_t, vec_ptr_t, vec_ptr_t>  res
+              = mycgbn_cube_arith(x0_a0, x0_a1, x0_a2, y0_a0, y0_a1, y0_a2, mnt6_modulus, io_bytes_per_elem, INVERSE_64BIT_MNT6);
 
     fflush(stdout);
     for (size_t i = 0; i < n; ++i) {
-      write_mnt_fq(res.first[i], outputs);
-      write_mnt_fq(res.second[i], outputs);
+      write_mnt_fq(std::get<0>(res)->at(i), outputs);
+      write_mnt_fq(std::get<1>(res)->at(i), outputs);
+      write_mnt_fq(std::get<2>(res)->at(i), outputs);
     }
 
     for (size_t i = 0; i < n; ++i) {
       free(x0_a0[i]);
       free(x0_a1[i]);
+      free(x0_a2[i]);
       free(y0_a0[i]);
       free(y0_a1[i]);
-      free(res.first[i]);
-      free(res.second[i]);
+      free(y0_a2[i]);
+      free(std::get<0>(res)->at(i));
+      free(std::get<1>(res)->at(i));
+      free(std::get<2>(res)->at(i));
     }
   }
 

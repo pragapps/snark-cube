@@ -4,6 +4,7 @@
 #include <cuda.h>
 #include <gmp.h>
 #include <cassert>
+#include <tuple>
 #include "cgbn/cgbn.h"
 #include "cgbn/utility/support.h"
 
@@ -30,6 +31,11 @@ typedef struct {
 typedef cgbn_context_t<TPI>         context_t;
 typedef cgbn_env_t<context_t, 768> env96_t;
 
+void freeMem(std::vector<uint8_t*>* v) {
+  for (int i = 0; i < v->size(); i ++) {
+     free(v->at(i));
+  }
+}
 void reduce_wide(mp_limb_t* result, mp_limb_t* num, mp_limb_t* modulus, uint64_t inv, int n) {
         mp_limb_t *res = num;
         for (size_t i = 0; i < n; ++i)
@@ -497,7 +503,7 @@ std::vector<uint8_t*>* mycgbn_montmul(std::vector<uint8_t*> a, std::vector<uint8
 // };
 
 std::tuple<vec_ptr_t, vec_ptr_t, vec_ptr_t> 
-compute_cubex_cuda(std::vector<uint8_t*> x0_a0,
+mycgbn_cube_arith(std::vector<uint8_t*> x0_a0,
                     std::vector<uint8_t*> x0_a1,
                     std::vector<uint8_t*> x0_a2,
                     std::vector<uint8_t*> y0_a0,
